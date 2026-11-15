@@ -1,18 +1,18 @@
 name: Build iOS IPA
 
-# 用途：不 fork 上游、不下载源码，只靠这一个文件在 GitHub 的 macOS runner 上
-# 构建出可自签安装的 iPhone 版 fqapp（什锦铺）未签名 IPA。
+# 在 GitHub 的 macOS runner 上构建可自签安装的 iPhone 版 fqapp（什锦铺）。
 #
-# 用法：在任意新建的空仓库里，添加本文件到 .github/workflows/ios.yml，
-# 然后 Actions → Build iOS IPA → Run workflow。
-# 产物：本次运行的 Artifacts → fqapp-ios-unsigned-ipa → 解压得到 .ipa。
+# 做法：把上游 ch6vip/fqapp 拉进 src/，再套用本仓库里的 fqapp-ios-full.patch
+# （给 iOS 补上听书播放），最后产出一个未签名 IPA。
 #
-# 不需要 Apple 开发者账号。签名在本地用 Sideloadly / SideStore 完成。
+# 仓库里需要两个文件：
+#   .github/workflows/ios.yml   本文件
+#   fqapp-ios-full.patch        代码补丁（听书 + 短剧/漫剧视频）
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: 源码仓库（默认上游；填自己的 fork 可带改动）
+        description: 上游仓库（换成分支/自己的 fork 也可以）
         type: string
         default: 'ch6vip/fqapp'
       source_ref:
@@ -39,13 +39,452 @@ jobs:
   build-ios:
     runs-on: macos-latest
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: src
     steps:
-      # 直接把上游源码拉进工作区；仓库本身可以是个空壳。
+      # 补丁已内嵌在下面的步骤里，所以只需要拉一份上游源码。
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.source_repo }}
           ref: ${{ inputs.source_ref }}
+          path: src
           persist-credentials: false
+
+      - name: Apply iOS full patch
+        run: |
+          set -euo pipefail
+          PATCH=/tmp/ios-full.patch
+          cat > "$PATCH" <<'PATCH_EOF'
+          --- a/pubspec.yaml
+          +++ b/pubspec.yaml
+          @@ -63,6 +63,10 @@
+             # Android/iOS/macOS/Linux 的播放库会一起进包（APK 多出 ~11 MB）。
+             media_kit_libs_windows_video: 1.0.11
+             media_kit_libs_linux: 1.2.1
+          +  # iOS 的 libmpv（含视频解码）。上游原先没给 iOS 接播放器，听书和短剧一点就
+          +  # MissingPluginException；这个包只对 iOS 生效，不进 Android 包体。
+          +  # 不要同时加 ios_audio 版本，两者都带 libmpv，会重复链接。
+          +  media_kit_libs_ios_video: 1.1.4
+             file_selector: ^1.1.0
+             flutter_tts: ^4.2.5
+             webview_windows:
+          --- a/rust/src/lib.rs
+          +++ b/rust/src/lib.rs
+          @@ -39,7 +39,9 @@
+           #[cfg(test)]
+           mod network_proxy_tests;
+           
+          -#[cfg(any(target_os = "windows", target_os = "linux"))]
+          +// iOS 也要用：听书/短剧的解密会话（fq_desktop_media_open）把带 key 的 CDN
+          +// 地址换成本机 127.0.0.1 上的明文流，iOS 端没有原生播放器，播放交给 libmpv。
+          +#[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+           mod desktop_fetch;
+          -#[cfg(any(target_os = "windows", target_os = "linux"))]
+          +#[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+           mod desktop_media;
+          --- a/rust/build.rs
+          +++ b/rust/build.rs
+          @@ -1,6 +1,7 @@
+           fn main() {
+               let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+          -    if target_os != "windows" && target_os != "linux" {
+          +    // iOS 复用同一套 C 解密核心（sp_stream / mp4_cenc / tiny_aes）。
+          +    if target_os != "windows" && target_os != "linux" && target_os != "ios" {
+                   return;
+               }
+               let sources = [
+          @@ -14,7 +15,7 @@
+               build
+                   .include("../native/crypto_core")
+                   .std("c11")
+          -        .pic(target_os == "linux")
+          +        .pic(target_os == "linux" || target_os == "ios")
+                   .flag_if_supported("/experimental:c11atomics")
+                   .define("CBC", "0")
+                   .define("CTR", "0")
+          --- a/lib/services/desktop_media.dart
+          +++ b/lib/services/desktop_media.dart
+          @@ -11,7 +11,14 @@
+           typedef _FreeNative = Void Function(Pointer<Utf8>);
+           typedef _Free = void Function(Pointer<Utf8>);
+           
+          +/// iOS 把 Rust 核心静态链进了主二进制（见 ios/Flutter/*.xcconfig 的 -force_load），
+          +/// 没有独立的 .a/.so 可以 dlopen，必须从进程自身符号表里查。
+          +DynamicLibrary _openCore(String path) =>
+          +    Platform.isIOS ? DynamicLibrary.process() : DynamicLibrary.open(path);
+          +
+           String desktopCoreLibraryPath() {
+          +  // iOS 无独立库文件，路径只用于日志，实际走 DynamicLibrary.process()。
+          +  if (Platform.isIOS) return 'process';
+             if (Platform.isLinux) {
+               return '${File(Platform.resolvedExecutable).parent.path}/lib/libfqapi_core.so';
+             }
+          @@ -79,7 +86,7 @@
+               final path = desktopCoreLibraryPath();
+               // Metadata probing performs synchronous native I/O, away from the UI isolate.
+               final result = await Isolate.run(() {
+          -      final lib = DynamicLibrary.open(path);
+          +      final lib = _openCore(path);
+                 final open = lib.lookupFunction<_OpenNative, _Open>(
+                   'fq_desktop_media_open',
+                 );
+          @@ -116,7 +123,7 @@
+             void close() {
+               if (_closed) return;
+               _closed = true;
+          -    final lib = DynamicLibrary.open(libraryPath);
+          +    final lib = _openCore(libraryPath);
+               final close = lib.lookupFunction<_FreeNative, _Free>(
+                 'fq_desktop_media_close',
+               );
+          --- a/lib/main.dart
+          +++ b/lib/main.dart
+          @@ -2,6 +2,7 @@
+           import 'widgets/desktop_app_frame.dart';
+           import 'services/native_player.dart';
+           import 'services/desktop_platform.dart';
+          +import 'services/ios_platform.dart';
+           import 'services/platform_capabilities.dart';
+           import 'services/platform_channel.dart';
+           
+          @@ -91,6 +92,8 @@
+             registerPortedUiLicenses();
+             if (isLinuxDesktop) await LinuxPlatform.install();
+             if (isWindowsDesktop) await DesktopPlatform.instance.initialize();
+          +  // iOS 没有原生播放器实现，用 Dart 侧的 media_kit 适配层补上听书。
+          +  if (isIOSPlatform) await IosPlatform.install();
+             // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
+             // [main] 的 runZonedGuarded 捕获；文件持久化异步开启，失败只退回内存模式。
+             AppLog.instance.install();
+          --- a/ios/Runner/Info.plist
+          +++ b/ios/Runner/Info.plist
+          @@ -49,6 +49,10 @@
+           	</dict>
+           	<key>UIApplicationSupportsIndirectInputEvents</key>
+           	<true/>
+          +	<key>UIBackgroundModes</key>
+          +	<array>
+          +		<string>audio</string>
+          +	</array>
+           	<key>UILaunchStoryboardName</key>
+           	<string>LaunchScreen</string>
+           	<key>UIMainStoryboardFile</key>
+          --- a/lib/services/platform_capabilities.dart
+          +++ b/lib/services/platform_capabilities.dart
+          @@ -5,8 +5,10 @@
+           /// 视频播放是否可用。
+           ///
+           /// 视频依赖原生播放器：Android 走 ExoPlayer 平台通道（`fqapp/native_player`），
+          -/// 桌面走 media_kit。iOS 首版没有播放器实现，直接进入播放页会抛
+          -/// `MissingPluginException`，所以入口整体降级为「暂不支持」。
+          +/// 桌面和 iOS 走 media_kit（iOS 由 media_kit_libs_ios_video 提供 libmpv）。
+          +/// iOS 的通道适配层是 `lib/services/ios_platform.dart`，纯 Dart 实现。
+           bool get supportsVideoPlayback =>
+               !kIsWeb &&
+          -    (defaultTargetPlatform == TargetPlatform.android || isWindowsDesktop);
+          +    (defaultTargetPlatform == TargetPlatform.android ||
+          +        defaultTargetPlatform == TargetPlatform.iOS ||
+          +        isWindowsDesktop);
+          --- a/lib/pages/player_page.dart
+          +++ b/lib/pages/player_page.dart
+          @@ -1,4 +1,5 @@
+           import '../services/desktop_platform.dart';
+          +import '../services/ios_platform.dart';
+           import '../services/audio_floating_routes.dart';
+           import '../services/app_log.dart';
+           import 'dart:async';
+          @@ -2005,6 +2006,11 @@
+                               texture,
+                               key: const ValueKey('player-texture'),
+                             )
+          +                : isIOSPlatform
+          +                ? IosPlatform.videoSurface(
+          +                    texture,
+          +                    key: const ValueKey('player-texture'),
+          +                  )
+                           : Texture(
+                               key: const ValueKey('player-texture'),
+                               textureId: texture,
+          --- a/lib/pages/drama_page.dart
+          +++ b/lib/pages/drama_page.dart
+          @@ -1,5 +1,6 @@
+           import '../widgets/video_player_chrome.dart';
+           import '../services/desktop_platform.dart';
+          +import '../services/ios_platform.dart';
+           
+           import 'dart:async';
+           
+          @@ -4285,6 +4286,11 @@
+                                         textureId,
+                                         key: ValueKey('drama_inline_${item.id}'),
+                                       )
+          +                          : isIOSPlatform
+          +                          ? IosPlatform.videoSurface(
+          +                              textureId,
+          +                              key: ValueKey('drama_inline_${item.id}'),
+          +                            )
+                                     : Texture(
+                                         key: ValueKey(
+                                           'drama_inline_texture_${item.kind}_${item.id}',
+          --- /dev/null
+          +++ b/lib/services/ios_platform.dart
+          @@ -0,0 +1,247 @@
+          +import 'dart:async';
+          +
+          +import 'package:flutter/foundation.dart';
+          +import 'package:flutter/services.dart';
+          +import 'package:flutter/widgets.dart';
+          +import 'package:media_kit/media_kit.dart';
+          +import 'package:media_kit_video/media_kit_video.dart';
+          +
+          +import 'app_log.dart';
+          +import 'desktop_media.dart';
+          +import 'platform_channel.dart';
+          +
+          +bool get isIOSPlatform => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+          +
+          +/// iOS 的 `fqapp/native_player` 适配层。
+          +///
+          +/// 上游只给 Android（ExoPlayer）和桌面（media_kit）实现了这条通道，iOS 的
+          +/// Runner 里没有任何 Swift 侧实现，所以听书/短剧一开播就抛 MissingPluginException。
+          +/// 这里不去补 Swift，而是在 Dart 里复刻同一份通道契约：
+          +///
+          +///   * 播放器用 media_kit（iOS 由 media_kit_libs_ios_video 提供 libmpv）；
+          +///   * 画面走 media_kit_video 的 [VideoController]，和 Windows 端同一实现；
+          +///   * 解密复用 Rust 核心的 `fq_desktop_media_open`，它把「CDN 地址 + key」
+          +///     换成本机 127.0.0.1 上的明文流，和 Windows/Linux 完全同一条路径；
+          +///   * 事件格式与 [NativePlayer] 读取的字段一一对应（type/value/playerId）。
+          +///
+          +/// `create` 回传的 playerId 同时充当「纹理 id」：`Texture` 在 iOS 上不可用，
+          +/// 页面通过 [IosPlatform.videoSurface] 用这个 id 反查 [VideoController]。
+          +class IosPlatform {
+          +  static final _events = StreamController<Map<String, dynamic>>.broadcast();
+          +  static final _players = <int, _IosPlayer>{};
+          +  static int _nextId = 1;
+          +  static bool _installed = false;
+          +
+          +  static Future<void> install() async {
+          +    if (_installed) return;
+          +    _installed = true;
+          +    MediaKit.ensureInitialized();
+          +    PlatformChannels.events = (name) {
+          +      if (name == 'fqapp/native_player/events') return _events.stream;
+          +      return const Stream<dynamic>.empty();
+          +    };
+          +    PlatformChannels.invoke = _invoke;
+          +  }
+          +
+          +  /// 渲染视频画面。与 `DesktopPlatform.videoSurface` 同签名，页面按平台二选一。
+          +  static Widget videoSurface(int id, {Key? key}) {
+          +    final host = _players[id];
+          +    if (host == null) return const SizedBox.expand();
+          +    return Video(
+          +      key: key,
+          +      controller: host.video,
+          +      controls: NoVideoControls,
+          +      fit: BoxFit.fill,
+          +      pauseUponEnteringBackgroundMode: false,
+          +      resumeUponEnteringForegroundMode: false,
+          +    );
+          +  }
+          +
+          +  static Future<dynamic> _invoke(
+          +    String channel,
+          +    String method,
+          +    dynamic arguments,
+          +  ) async {
+          +    if (channel != 'fqapp/native_player') {
+          +      // 其余 fqapp/* 通道（system_tts、reader 亮度、分享等）在 iOS 上确实
+          +      // 没有原生实现。保持与「没有适配层」时一致的 MissingPluginException，
+          +      // 调用方已有的降级分支照常生效。
+          +      throw MissingPluginException('$channel.$method');
+          +    }
+          +    final args = arguments is Map ? arguments : const <dynamic, dynamic>{};
+          +    switch (method) {
+          +      case 'create':
+          +        final id = _nextId++;
+          +        final host = _IosPlayer(id, _events.add);
+          +        _players[id] = host;
+          +        unawaited(
+          +          host.open(
+          +            args['cdnUrl'] as String? ?? '',
+          +            args['keyHex'] as String? ?? '',
+          +          ),
+          +        );
+          +        return <String, dynamic>{'playerId': id};
+          +
+          +      case 'dispose':
+          +        final id = args['id'];
+          +        if (id is num) {
+          +          final host = _players.remove(id.toInt());
+          +          if (host != null) await host.dispose();
+          +        }
+          +        return null;
+          +
+          +      // 系统媒体卡片 / 前台服务 / 悬浮窗都是 Android 专有概念，iOS 直接吞掉。
+          +      case 'setKeepScreenOn':
+          +      case 'startListenForeground':
+          +      case 'stopListenForeground':
+          +      case 'allocateFloatingOwner':
+          +      case 'startFloating':
+          +      case 'showFloating':
+          +      case 'updateFloating':
+          +      case 'stopFloating':
+          +      case 'swapFloatingPlayer':
+          +      case 'canDrawOverlays':
+          +        return method == 'canDrawOverlays' ? false : null;
+          +
+          +      case 'play':
+          +      case 'pause':
+          +      case 'seek':
+          +      case 'setRate':
+          +      case 'setVolume':
+          +        final id = args['id'];
+          +        final host = id is num ? _players[id.toInt()] : null;
+          +        if (host == null) return null;
+          +        await host.command(method, args);
+          +        return null;
+          +
+          +      default:
+          +        // 未识别的播放器指令不抛异常：多出来的指令应当无副作用地跳过，
+          +        // 而不是让整页报错。
+          +        return null;
+          +    }
+          +  }
+          +}
+          +
+          +class _IosPlayer {
+          +  _IosPlayer(this.id, this.emit) {
+          +    video = VideoController(player);
+          +    unawaited(
+          +      video.waitUntilFirstFrameRendered.then((_) => _event('firstFrame', true)),
+          +    );
+          +    _subscriptions.addAll([
+          +      player.stream.position.listen((v) => _event('position', v.inMilliseconds)),
+          +      player.stream.duration.listen((v) => _event('duration', v.inMilliseconds)),
+          +      player.stream.playing.listen((v) => _event('playing', v)),
+          +      player.stream.buffering.listen((v) => _event('buffering', v)),
+          +      player.stream.completed.listen((v) => _event('completed', v)),
+          +      player.stream.width.listen((_) => _size()),
+          +      player.stream.height.listen((_) => _size()),
+          +      player.stream.error.listen((message) {
+          +        AppLog.w('ios-player', 'id=$id media error: $message');
+          +        _event('error', {'message': '媒体播放失败，请重试或切换清晰度'});
+          +      }),
+          +    ]);
+          +  }
+          +
+          +  final int id;
+          +  final void Function(Map<String, dynamic>) emit;
+          +  final player = Player();
+          +  late final VideoController video;
+          +  final _subscriptions = <StreamSubscription<dynamic>>[];
+          +  final _ready = Completer<void>();
+          +  DesktopMedia? _media;
+          +  bool disposed = false;
+          +
+          +  void _event(String type, dynamic value) {
+          +    if (!disposed) emit({'playerId': id, 'type': type, 'value': value});
+          +  }
+          +
+          +  void _size() {
+          +    if (disposed) return;
+          +    // 与桌面端一致：rotationCorrection 恒为 0，media_kit 已经把旋转烘进画面。
+          +    emit({
+          +      'playerId': id,
+          +      'type': 'videoSize',
+          +      'width': player.state.width ?? 0,
+          +      'height': player.state.height ?? 0,
+          +      'rotationCorrection': 0,
+          +    });
+          +  }
+          +
+          +  Future<void> open(String url, String key) async {
+          +    _ready.future.ignore();
+          +    try {
+          +      var playbackUrl = url;
+          +      if (key.isNotEmpty) {
+          +        final session = await DesktopMedia.open(url, key);
+          +        if (disposed) {
+          +          session.close();
+          +          return;
+          +        }
+          +        _media = session;
+          +        playbackUrl = session.url;
+          +      }
+          +      if (disposed) return;
+          +      await player.open(Media(playbackUrl), play: false);
+          +      if (disposed) return;
+          +      if (!_ready.isCompleted) _ready.complete();
+          +      // 纯音频同样回一个占位 id 当作「创建完成」，页面不会去取画面。
+          +      _event('created', id);
+          +      _size();
+          +      AppLog.d('ios-player', 'id=$id opened');
+          +    } catch (error) {
+          +      if (!_ready.isCompleted) {
+          +        _ready.completeError(StateError('无法打开媒体'));
+          +      }
+          +      final value = desktopOpenFailure(id, error);
+          +      if (!disposed) {
+          +        emit({'playerId': id, 'type': 'error', 'value': value});
+          +      }
+          +      _media?.close();
+          +      _media = null;
+          +    }
+          +  }
+          +
+          +  Future<void> command(String method, Map args) async {
+          +    try {
+          +      await _ready.future;
+          +    } catch (_) {
+          +      return;
+          +    }
+          +    if (disposed) return;
+          +    switch (method) {
+          +      case 'play':
+          +        await player.play();
+          +        _event('playWhenReady', true);
+          +      case 'pause':
+          +        await player.pause();
+          +        _event('playWhenReady', false);
+          +      case 'seek':
+          +        final ms = args['positionMs'];
+          +        if (ms is num) await player.seek(Duration(milliseconds: ms.toInt()));
+          +      case 'setRate':
+          +        final rate = args['rate'];
+          +        if (rate is num) await player.setRate(rate.toDouble());
+          +      case 'setVolume':
+          +        final volume = args['volume'];
+          +        if (volume is num) {
+          +          await player.setVolume(volume.toDouble().clamp(0, 1) * 100);
+          +        }
+          +    }
+          +  }
+          +
+          +  Future<void> dispose() async {
+          +    if (disposed) return;
+          +    disposed = true;
+          +    if (!_ready.isCompleted) _ready.complete();
+          +    for (final subscription in _subscriptions) {
+          +      await subscription.cancel();
+          +    }
+          +    try {
+          +      await player.dispose();
+          +    } finally {
+          +      _media?.close();
+          +      _media = null;
+          +    }
+          +  }
+          +}
+          PATCH_EOF
+          echo "补丁行数: $(wc -l < "$PATCH")"
+          git -c core.autocrlf=false apply --verbose "$PATCH"
+          echo "--- 补丁生效检查 ---"
+          grep -q "media_kit_libs_ios_video" pubspec.yaml && echo "pubspec OK"
+          grep -q "isIOSPlatform" lib/pages/player_page.dart && echo "player_page OK"
+          grep -q 'target_os = "ios"' rust/src/lib.rs && echo "rust cfg OK"
+          test -f lib/services/ios_platform.dart && echo "ios_platform.dart OK"
 
       - name: Select newest installed Xcode
         run: |
@@ -77,13 +516,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ios-cargo-${{ inputs.rust_version }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/*.rs') }}
+            src/rust/target
+          key: ios-cargo-${{ inputs.rust_version }}-${{ hashFiles('src/rust/Cargo.lock', 'src/rust/**/*.rs', 'src/rust/build.rs') }}
           restore-keys: |
             ios-cargo-${{ inputs.rust_version }}-
 
-      # Xcode 新版 + Swift Package Manager 有已知构建失败，上游 IOS.md 要求关掉。
-      # 老版本 Flutter 没有该开关，失败不致命。
+      # 新版 Xcode + Swift Package Manager 有已知构建失败，上游 IOS.md 要求关掉。
       - name: Disable Swift Package Manager
         run: flutter config --no-enable-swift-package-manager || echo "该 Flutter 版本不支持此开关，跳过"
 
@@ -93,13 +531,21 @@ jobs:
       - name: Resolve Dart dependencies
         run: |
           set -euo pipefail
-          flutter pub get --enforce-lockfile || {
-            echo "::warning::--enforce-lockfile 失败，退回普通 pub get"
-            flutter pub get
-          }
+          # 补丁改了 pubspec，lock 必然对不上，直接走普通 pub get 更新 lock。
+          flutter pub get || { echo "pub get 失败"; exit 1; }
+
+      # 把编译错误挡在昂贵的 Rust / Xcode 步骤之前，省 10 分钟。
+      - name: Analyze touched Dart files
+        run: |
+          set -euo pipefail
+          flutter analyze --no-pub \
+            lib/services/ios_platform.dart \
+            lib/services/desktop_media.dart \
+            lib/main.dart
 
       # Rust 核心编成 staticlib → ios/Frameworks/libfqapi_core.a
-      # 脚本内部设 CARGO_PROFILE_RELEASE_STRIP=debuginfo，否则 release 的 strip 会裁掉 dlsym 需要的符号。
+      # 补丁放开了 desktop_media 在 iOS 上编译，C 解密核心（sp_stream / mp4_cenc）
+      # 由 build.rs 一并编进来。
       - name: Build Rust core as iOS static library
         run: |
           set -euo pipefail
@@ -125,31 +571,30 @@ jobs:
       - name: Build iOS app (unsigned)
         run: |
           set -euo pipefail
-          flutter build ios --release --no-codesign 2>&1 | tee build-ios.log
+          flutter build ios --release --no-codesign 2>&1 | tee ../build-ios.log
 
       - name: Package unsigned IPA
         run: |
           set -euo pipefail
           APP=build/ios/iphoneos/Runner.app
           test -d "$APP" || { echo "Runner.app 不存在，构建失败"; exit 1; }
-          # 主二进制里应能找到 Rust 入口符号，找不到就是白屏。
+          # 主二进制里必须能找到 Rust 入口，找不到就是白屏。
           nm -gU "$APP/Runner" 2>/dev/null | grep -qi "frb\|fqapi" \
-            || echo "::warning::未检出 frb/fqapi 导出符号，运行时可能找不到 Rust 入口"
+            || { echo "主二进制缺少 frb/fqapi 导出符号"; exit 1; }
           rm -rf /tmp/pack && mkdir -p /tmp/pack/Payload
           ditto "$APP" /tmp/pack/Payload/Runner.app
           VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *([^+]+).*/\1/')
-          IPA="fqapp-ios-${VERSION}-unsigned.ipa"
-          (cd /tmp/pack && zip -qry "$OLDPWD/$IPA" Payload)
-          ls -lh "$IPA"
-          shasum -a 256 "$IPA" | tee SHA256SUMS.txt
-          echo "IPA=$IPA" >> "$GITHUB_ENV"
+          OUT="fqapp-ios-${VERSION}-full.ipa"
+          (cd /tmp/pack && zip -qry "$OLDPWD/$OUT" Payload)
+          ls -lh "$OUT"
+          shasum -a 256 "$OUT" | tee SHA256SUMS.txt
+          echo "IPA=src/$OUT" >> "$GITHUB_ENV"
 
       - name: Report build fingerprint
         run: |
           set -euo pipefail
-          echo "source:  ${{ inputs.source_repo }}@${{ inputs.source_ref }}"
+          echo "source:  ${{ inputs.source_repo }}@${{ inputs.source_ref }} + ios-full.patch"
           echo "flutter: $(flutter --version | head -1)"
-          echo "dart:    $(dart --version 2>&1)"
           echo "rustc:   $(rustc --version)"
           echo "xcode:   $(xcodebuild -version | head -1)"
 
@@ -158,7 +603,7 @@ jobs:
           name: fqapp-ios-unsigned-ipa
           path: |
             ${{ env.IPA }}
-            SHA256SUMS.txt
+            src/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -168,6 +613,6 @@ jobs:
           name: ios-build-logs
           path: |
             build-ios.log
-            build/ios/**/*.log
+            src/build/ios/**/*.log
             ~/Library/Logs/gym/*.log
           if-no-files-found: ignore
