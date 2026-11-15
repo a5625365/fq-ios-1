@@ -1,0 +1,173 @@
+name: Build iOS IPA
+
+# 用途：不 fork 上游、不下载源码，只靠这一个文件在 GitHub 的 macOS runner 上
+# 构建出可自签安装的 iPhone 版 fqapp（什锦铺）未签名 IPA。
+#
+# 用法：在任意新建的空仓库里，添加本文件到 .github/workflows/ios.yml，
+# 然后 Actions → Build iOS IPA → Run workflow。
+# 产物：本次运行的 Artifacts → fqapp-ios-unsigned-ipa → 解压得到 .ipa。
+#
+# 不需要 Apple 开发者账号。签名在本地用 Sideloadly / SideStore 完成。
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 源码仓库（默认上游；填自己的 fork 可带改动）
+        type: string
+        default: 'ch6vip/fqapp'
+      source_ref:
+        description: 分支或 tag
+        type: string
+        default: 'master'
+      flutter_version:
+        description: Flutter 版本（pubspec.lock 要求 >=3.47.0）
+        type: string
+        default: '3.50.0'
+      rust_version:
+        description: Rust 工具链版本
+        type: string
+        default: '1.99.1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      # 直接把上游源码拉进工作区；仓库本身可以是个空壳。
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Select newest installed Xcode
+        run: |
+          set -euo pipefail
+          echo "已安装的 Xcode："
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          BEST=$(ls -d /Applications/Xcode*.app 2>/dev/null \
+            | sed -E 's#/Applications/Xcode(.*)\.app#\1#' \
+            | sort -V | tail -1)
+          if [ -z "${BEST}" ]; then echo "runner 上没有 Xcode"; exit 1; fi
+          sudo xcode-select -s "/Applications/Xcode${BEST}.app/Contents/Developer"
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_version }}
+          targets: aarch64-apple-ios
+
+      - name: Cache cargo build directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ios-cargo-${{ inputs.rust_version }}-${{ hashFiles('rust/Cargo.lock', 'rust/**/*.rs') }}
+          restore-keys: |
+            ios-cargo-${{ inputs.rust_version }}-
+
+      # Xcode 新版 + Swift Package Manager 有已知构建失败，上游 IOS.md 要求关掉。
+      # 老版本 Flutter 没有该开关，失败不致命。
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager || echo "该 Flutter 版本不支持此开关，跳过"
+
+      - name: Precache iOS artifacts
+        run: flutter precache --ios
+
+      - name: Resolve Dart dependencies
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile || {
+            echo "::warning::--enforce-lockfile 失败，退回普通 pub get"
+            flutter pub get
+          }
+
+      # Rust 核心编成 staticlib → ios/Frameworks/libfqapi_core.a
+      # 脚本内部设 CARGO_PROFILE_RELEASE_STRIP=debuginfo，否则 release 的 strip 会裁掉 dlsym 需要的符号。
+      - name: Build Rust core as iOS static library
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build_rust_ios.sh
+          ./scripts/build_rust_ios.sh
+
+      - name: Verify the static library
+        run: |
+          set -euo pipefail
+          lipo -info ios/Frameworks/libfqapi_core.a
+          size=$(stat -f%z ios/Frameworks/libfqapi_core.a)
+          echo "libfqapi_core.a = ${size} bytes"
+          if [ "$size" -lt 1000000 ]; then
+            echo "静态库异常偏小，Rust 构建没真正产出"; exit 1
+          fi
+
+      - name: Install CocoaPods dependencies
+        run: |
+          set -euo pipefail
+          cd ios
+          pod install --repo-update 2>&1 | tail -40
+
+      - name: Build iOS app (unsigned)
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign 2>&1 | tee build-ios.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP=build/ios/iphoneos/Runner.app
+          test -d "$APP" || { echo "Runner.app 不存在，构建失败"; exit 1; }
+          # 主二进制里应能找到 Rust 入口符号，找不到就是白屏。
+          nm -gU "$APP/Runner" 2>/dev/null | grep -qi "frb\|fqapi" \
+            || echo "::warning::未检出 frb/fqapi 导出符号，运行时可能找不到 Rust 入口"
+          rm -rf /tmp/pack && mkdir -p /tmp/pack/Payload
+          ditto "$APP" /tmp/pack/Payload/Runner.app
+          VERSION=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *([^+]+).*/\1/')
+          IPA="fqapp-ios-${VERSION}-unsigned.ipa"
+          (cd /tmp/pack && zip -qry "$OLDPWD/$IPA" Payload)
+          ls -lh "$IPA"
+          shasum -a 256 "$IPA" | tee SHA256SUMS.txt
+          echo "IPA=$IPA" >> "$GITHUB_ENV"
+
+      - name: Report build fingerprint
+        run: |
+          set -euo pipefail
+          echo "source:  ${{ inputs.source_repo }}@${{ inputs.source_ref }}"
+          echo "flutter: $(flutter --version | head -1)"
+          echo "dart:    $(dart --version 2>&1)"
+          echo "rustc:   $(rustc --version)"
+          echo "xcode:   $(xcodebuild -version | head -1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-ios-unsigned-ipa
+          path: |
+            ${{ env.IPA }}
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-build-logs
+          path: |
+            build-ios.log
+            build/ios/**/*.log
+            ~/Library/Logs/gym/*.log
+          if-no-files-found: ignore
