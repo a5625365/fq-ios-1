@@ -69,6 +69,19 @@ jobs:
              file_selector: ^1.1.0
              flutter_tts: ^4.2.5
              webview_windows:
+          --- a/rust/Cargo.toml
+          +++ b/rust/Cargo.toml
+          @@ -43,7 +43,9 @@
+           [build-dependencies]
+           cc = "1"
+           
+          -[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+          +# iOS 的听书/短剧也走 desktop_fetch（reqwest::blocking 拉 CDN 分片），
+          +# 少了这一段，iOS 上编译会报「找不到 reqwest::blocking」。
+          +[target.'cfg(any(windows, target_os = "linux", target_os = "ios"))'.dependencies]
+           reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
+           
+           # The shipping app runs the core in-process on Android; `adb logcat` is the
           --- a/rust/src/lib.rs
           +++ b/rust/src/lib.rs
           @@ -39,7 +39,9 @@
@@ -83,6 +96,67 @@ jobs:
           -#[cfg(any(target_os = "windows", target_os = "linux"))]
           +#[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
            mod desktop_media;
+          --- a/rust/src/network.rs
+          +++ b/rust/src/network.rs
+          @@ -8,16 +8,16 @@
+           #[derive(Clone, Default)]
+           pub(crate) struct Policy {
+               generation: u64,
+          -    #[cfg(any(target_os = "windows", target_os = "linux"))]
+          +    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+               proxy: Option<reqwest::Proxy>,
+           }
+           static POLICY: RwLock<Policy> = RwLock::new(Policy {
+               generation: 0,
+          -    #[cfg(any(target_os = "windows", target_os = "linux"))]
+          +    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+               proxy: None,
+           });
+           
+          -#[cfg(any(target_os = "windows", target_os = "linux", test))]
+          +#[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios", test))]
+           impl NetworkProxy {
+               pub(crate) fn validate(&self) -> Result<Option<reqwest::Proxy>, String> {
+                   if !self.enabled {
+          @@ -56,12 +56,12 @@
+               }
+           }
+           
+          -#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+          +#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "ios")))]
+           pub(crate) fn apply(_config: &NetworkProxy) -> Result<(), String> {
+               Ok(())
+           }
+           
+          -#[cfg(any(target_os = "windows", target_os = "linux"))]
+          +#[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+           pub(crate) fn apply(config: &NetworkProxy) -> Result<(), String> {
+               let proxy = config.validate()?;
+               let mut policy = POLICY.write().map_err(|_| "network policy lock poisoned")?;
+          @@ -75,12 +75,12 @@
+           }
+           
+           impl Policy {
+          -    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+          +    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "ios")))]
+               pub(crate) fn configure(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+                   builder
+               }
+           
+          -    #[cfg(any(target_os = "windows", target_os = "linux"))]
+          +    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+               pub(crate) fn configure(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+                   match &self.proxy {
+                       Some(proxy) => builder.no_proxy().proxy(proxy.clone()),
+          @@ -91,7 +91,7 @@
+                       }
+                   }
+               }
+          -    #[cfg(any(target_os = "windows", target_os = "linux"))]
+          +    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "ios"))]
+               pub(crate) fn configure_blocking(
+                   &self,
+                   builder: reqwest::blocking::ClientBuilder,
           --- a/rust/build.rs
           +++ b/rust/build.rs
           @@ -1,6 +1,7 @@
@@ -483,7 +557,8 @@ jobs:
           echo "--- 补丁生效检查 ---"
           grep -q "media_kit_libs_ios_video" pubspec.yaml && echo "pubspec OK"
           grep -q "isIOSPlatform" lib/pages/player_page.dart && echo "player_page OK"
-          grep -q 'target_os = "ios"' rust/src/lib.rs && echo "rust cfg OK"
+          grep -q 'target_os = "ios"' rust/Cargo.toml && echo "cargo cfg OK"
+          grep -q 'target_os = "ios"' rust/src/network.rs && echo "network cfg OK"
           test -f lib/services/ios_platform.dart && echo "ios_platform.dart OK"
 
       - name: Select newest installed Xcode
