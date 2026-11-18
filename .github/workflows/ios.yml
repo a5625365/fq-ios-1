@@ -516,9 +516,48 @@ jobs:
              }
            }
            
+          --- a/lib/services/native_player.dart
+          +++ b/lib/services/native_player.dart
+          @@ -332,6 +332,14 @@
+             /// 仍用 Media3 内建的 Sonic，否则视频倍速会跟着变（音频处理与视频渲染
+             /// 必须同步走同一套计时）。见 issue #129。
+             final bool audioOnly;
+          +
+          +  /// 可选的「预热音源」钩子：拿到下一集的 url + key 时先交给平台层建会话。
+          +  ///
+          +  /// iOS 换章时若现建会话，要向上游 CDN 探测一次；而此刻上一集已播完、
+          +  /// 下一集还没出声，系统会掐掉后台网络，探测必然失败 —— 表现就是锁屏时
+          +  /// 「播完这一章，切下一章报播放错误」。提前建好就没有这个空档。
+          +  /// 其它平台不实现，保持 null 即可。
+          +  static Future<void> Function(String url, String key)? warmMediaSession;
+           
+             int? get textureId => _textureId;
+             int? get playerId => _playerId;
+          --- a/lib/services/audio_playback_controller.dart
+          +++ b/lib/services/audio_playback_controller.dart
+          @@ -142,9 +142,16 @@
+               final cacheKey = '$nextId|$_toneId';
+               if (_audioSourceCache.containsKey(cacheKey)) return;
+               unawaited(
+          -      _loadSourceWithRetry(
+          -        nextId,
+          -      ).catchError((Object _) => AudioSource(itemId: nextId, url: '')),
+          +      _loadSourceWithRetry(nextId)
+          +          .then((source) {
+          +            // 平台层（iOS）用它在当前集还在播时先把下一集的解密会话建好，
+          +            // 避免换章那一刻没有网络可用。
+          +            final warm = NativePlayer.warmMediaSession;
+          +            if (warm != null && source.url.isNotEmpty) {
+          +              unawaited(warm(source.url, source.keyHex));
+          +            }
+          +          })
+          +          .catchError((Object _) => AudioSource(itemId: nextId, url: '')),
+               );
+             }
+           
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,405 @@
+          @@ -0,0 +1,451 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -529,6 +568,7 @@ jobs:
           +
           +import 'app_log.dart';
           +import 'desktop_media.dart';
+          +import 'native_player.dart';
           +import 'platform_channel.dart';
           +
           +bool get isIOSPlatform => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
@@ -559,6 +599,10 @@ jobs:
           +  static int? _activePlayerId;
           +  static bool _resumeAfterInterruption = false;
           +
+          +  /// 已提前建好的解密会话，按「原始 CDN 地址」索引。换章时直接取用，
+          +  /// 这样切下一集那一刻完全不需要网络。
+          +  static final _warmSessions = <String, Future<DesktopMedia>>{};
+          +
           +  static Future<void> install() async {
           +    if (_installed) return;
           +    _installed = true;
@@ -568,6 +612,7 @@ jobs:
           +      return const Stream<dynamic>.empty();
           +    };
           +    PlatformChannels.invoke = _invoke;
+          +    NativePlayer.warmMediaSession = _warm;
           +
           +    // 锁屏、控制中心、耳机线控的按钮：原生桥转成播放器已有的指令格式，
           +    // 复用 Android 前台服务那一套处理逻辑（NativePlayer._handleMethodCall）。
@@ -587,6 +632,28 @@ jobs:
           +    });
           +    // 启动时就激活音频会话，别等第一次锁屏才配置。
           +    unawaited(_nativePlayback.invokeMethod<void>('configure'));
+          +  }
+          +
+          +  /// 提前为下一集建好解密会话。最多保留两条，超出的立刻关掉，
+          +  /// 避免一直占着本机端口和后台线程。
+          +  static Future<void> _warm(String url, String key) async {
+          +    if (url.isEmpty || key.isEmpty) return;
+          +    if (_warmSessions.containsKey(url)) return;
+          +    while (_warmSessions.length >= 2) {
+          +      final oldest = _warmSessions.keys.first;
+          +      final stale = _warmSessions.remove(oldest);
+          +      if (stale != null) {
+          +        unawaited(stale.then<void>((s) => s.close()).catchError((Object _) {}));
+          +      }
+          +    }
+          +    final pending = DesktopMedia.open(url, key);
+          +    _warmSessions[url] = pending;
+          +    unawaited(
+          +      pending.then<void>((_) {}).catchError((Object _) {
+          +        // 预热失败不留垃圾，换章时再按正常流程重试即可。
+          +        if (identical(_warmSessions[url], pending)) _warmSessions.remove(url);
+          +      }),
+          +    );
           +  }
           +
           +  /// 别的 App 抢走音频会话时暂停，会话还回来时继续。
@@ -644,10 +711,12 @@ jobs:
           +          audioOnly: args['audioOnly'] == true,
           +        );
           +        _players[id] = host;
+          +        final cdnUrl = args['cdnUrl'] as String? ?? '';
           +        unawaited(
           +          host.open(
-          +            args['cdnUrl'] as String? ?? '',
+          +            cdnUrl,
           +            args['keyHex'] as String? ?? '',
+          +            prepared: _warmSessions.remove(cdnUrl),
           +          ),
           +        );
           +        return <String, dynamic>{'playerId': id};
@@ -800,14 +869,30 @@ jobs:
           +    throw last ?? StateError('无法创建媒体会话');
           +  }
           +
-          +  Future<void> open(String url, String key) async {
+          +  Future<void> open(
+          +    String url,
+          +    String key, {
+          +    Future<DesktopMedia>? prepared,
+          +  }) async {
           +    _ready.future.ignore();
           +    _sourceUrl = url;
           +    _keyHex = key;
           +    try {
           +      var playbackUrl = url;
           +      if (key.isNotEmpty) {
-          +        final session = await _openSessionWithRetry();
+          +        DesktopMedia session;
+          +        if (prepared != null) {
+          +          try {
+          +            session = await prepared;
+          +            AppLog.d('ios-player', 'id=$id used warmed session');
+          +          } catch (error) {
+          +            // 预热的会话可能已经失效，退回正常流程（含重试）。
+          +            AppLog.w('ios-player', 'id=$id warmed session unusable: $error');
+          +            session = await _openSessionWithRetry();
+          +          }
+          +        } else {
+          +          session = await _openSessionWithRetry();
+          +        }
           +        if (disposed) {
           +          session.close();
           +          return;
