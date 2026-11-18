@@ -301,9 +301,214 @@ jobs:
                                      : Texture(
                                          key: ValueKey(
                                            'drama_inline_texture_${item.kind}_${item.id}',
+          --- a/ios/Runner/AppDelegate.swift
+          +++ b/ios/Runner/AppDelegate.swift
+          @@ -1,4 +1,6 @@
+          +import AVFoundation
+           import Flutter
+          +import MediaPlayer
+           import Security
+           import UIKit
+           
+          @@ -8,12 +10,195 @@
+               _ application: UIApplication,
+               didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+             ) -> Bool {
+          +    // 锁屏/切后台后要继续播，必须先拿到 .playback 音频会话；
+          +    // 只有 Info.plist 的 UIBackgroundModes=audio 是不够的。
+          +    PlaybackBridge.configureAudioSession()
+               return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+             }
+           
+             func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
+               GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+               SecureKeyBridge.register(messenger: engineBridge.applicationRegistrar.messenger())
+          +    PlaybackBridge.register(messenger: engineBridge.applicationRegistrar.messenger())
+          +  }
+          +}
+          +
+          +/// 锁屏 / 控制中心的「正在播放」桥。
+          +///
+          +/// 两件事在 Dart 侧做不到，必须原生实现：
+          +///   1. `AVAudioSession` 设成 `.playback` 并激活 —— 否则锁屏后 iOS 会挂起进程，
+          +///      Rust 核心的本地解密流断掉，播放器几秒后报「播放出错」；
+          +///   2. `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` —— 锁屏和通知栏的
+          +///      播放条、封面、进度、以及耳机线控/锁屏按钮的回调。
+          +///
+          +/// 通道：`fqapp/ios_playback`
+          +///   Dart → 原生：startListenForeground / stopListenForeground / configure
+          +///   原生 → Dart：remoteAction({action, positionMs?})，由 Dart 转成播放器已有的
+          +///   `onNotificationAction` 指令，复用 Android 前台服务那一套处理逻辑。
+          +final class PlaybackBridge {
+          +  private static var channel: FlutterMethodChannel?
+          +  private static var commandsInstalled = false
+          +  private static var coverTask: URLSessionDataTask?
+          +  private static var hasPrev = true
+          +  private static var hasNext = true
+          +
+          +  /// 只配置一次全局音频会话；重复调用是安全的。
+          +  static func configureAudioSession() {
+          +    let session = AVAudioSession.sharedInstance()
+          +    do {
+          +      try session.setCategory(.playback, mode: .spokenAudio, options: [])
+          +      try session.setActive(true)
+          +    } catch {
+          +      NSLog("fqapp playback: audio session failed \(error.localizedDescription)")
+          +    }
+          +    NotificationCenter.default.addObserver(
+          +      forName: AVAudioSession.interruptionNotification,
+          +      object: session,
+          +      queue: .main
+          +    ) { note in
+          +      guard
+          +        let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+          +        let type = AVAudioSession.InterruptionType(rawValue: raw)
+          +      else { return }
+          +      switch type {
+          +      case .began:
+          +        // 来电等打断：交给系统暂停，恢复时重新激活会话。
+          +        break
+          +      case .ended:
+          +        let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+          +        if AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume) {
+          +          try? session.setActive(true)
+          +        }
+          +      @unknown default:
+          +        break
+          +      }
+          +    }
+          +  }
+          +
+          +  static func register(messenger: FlutterBinaryMessenger) {
+          +    let bridge = FlutterMethodChannel(name: "fqapp/ios_playback", binaryMessenger: messenger)
+          +    channel = bridge
+          +    bridge.setMethodCallHandler { call, result in
+          +      let args = call.arguments as? [String: Any] ?? [:]
+          +      switch call.method {
+          +      case "configure":
+          +        configureAudioSession()
+          +        result(nil)
+          +      case "startListenForeground":
+          +        apply(args)
+          +        result(nil)
+          +      case "stopListenForeground":
+          +        clear()
+          +        result(nil)
+          +      default:
+          +        result(FlutterMethodNotImplemented)
+          +      }
+          +    }
+          +    installRemoteCommands()
+          +  }
+          +
+          +  /// 同步「正在播放」信息。Dart 侧每次状态变化都会调一次，这里整体覆盖即可。
+          +  private static func apply(_ args: [String: Any]) {
+          +    let title = args["title"] as? String ?? ""
+          +    let episode = args["episode"] as? String ?? ""
+          +    let playing = args["playing"] as? Bool ?? true
+          +    let positionMs = (args["positionMs"] as? NSNumber)?.doubleValue ?? 0
+          +    let durationMs = (args["durationMs"] as? NSNumber)?.doubleValue ?? 0
+          +    let speed = (args["speed"] as? NSNumber)?.doubleValue ?? 1
+          +    hasPrev = args["hasPrev"] as? Bool ?? true
+          +    hasNext = args["hasNext"] as? Bool ?? true
+          +
+          +    try? AVAudioSession.sharedInstance().setActive(true)
+          +
+          +    var info: [String: Any] = [
+          +      MPMediaItemPropertyTitle: title,
+          +      MPMediaItemPropertyArtist: episode,
+          +      MPNowPlayingInfoPropertyElapsedPlaybackTime: positionMs / 1000.0,
+          +      MPNowPlayingInfoPropertyPlaybackRate: playing ? speed : 0.0,
+          +      MPNowPlayingInfoPropertyDefaultPlaybackRate: speed,
+          +    ]
+          +    if durationMs > 0 {
+          +      info[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000.0
+          +    }
+          +    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+          +    UIApplication.shared.beginReceivingRemoteControlEvents()
+          +    updateCommandAvailability()
+          +    loadCover(args["coverUrl"] as? String)
+          +  }
+          +
+          +  private static func clear() {
+          +    coverTask?.cancel()
+          +    coverTask = nil
+          +    MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+          +    UIApplication.shared.endReceivingRemoteControlEvents()
+          +  }
+          +
+          +  /// 封面异步下载；拿不到就只显示文字，不影响播放与控制。
+          +  private static func loadCover(_ urlString: String?) {
+          +    coverTask?.cancel()
+          +    coverTask = nil
+          +    guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else { return }
+          +    let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+          +      guard let data, let image = UIImage(data: data) else { return }
+          +      DispatchQueue.main.async {
+          +        guard var info = MPNowPlayingInfoCenter.default().nowPlayingInfo else { return }
+          +        info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in
+          +          image
+          +        }
+          +        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+          +      }
+          +    }
+          +    coverTask = task
+          +    task.resume()
+          +  }
+          +
+          +  private static func installRemoteCommands() {
+          +    guard !commandsInstalled else { return }
+          +    commandsInstalled = true
+          +    let center = MPRemoteCommandCenter.shared()
+          +    _ = center.playCommand.addTarget { _ in
+          +      send("play")
+          +      return .success
+          +    }
+          +    _ = center.pauseCommand.addTarget { _ in
+          +      send("pause")
+          +      return .success
+          +    }
+          +    _ = center.togglePlayPauseCommand.addTarget { _ in
+          +      send("playPause")
+          +      return .success
+          +    }
+          +    _ = center.nextTrackCommand.addTarget { _ in
+          +      send("next")
+          +      return .success
+          +    }
+          +    _ = center.previousTrackCommand.addTarget { _ in
+          +      send("prev")
+          +      return .success
+          +    }
+          +    _ = center.stopCommand.addTarget { _ in
+          +      send("stop")
+          +      return .success
+          +    }
+          +    _ = center.changePlaybackPositionCommand.addTarget { event in
+          +      guard let seek = event as? MPChangePlaybackPositionCommandEvent else {
+          +        return .commandFailed
+          +      }
+          +      send("seekTo", extra: ["positionMs": Int(seek.positionTime * 1000)])
+          +      return .success
+          +    }
+          +  }
+          +
+          +  private static func updateCommandAvailability() {
+          +    let center = MPRemoteCommandCenter.shared()
+          +    center.nextTrackCommand.isEnabled = hasNext
+          +    center.previousTrackCommand.isEnabled = hasPrev
+          +  }
+          +
+          +  private static func send(_ action: String, extra: [String: Any] = [:]) {
+          +    var payload: [String: Any] = ["action": action]
+          +    for (key, value) in extra { payload[key] = value }
+          +    channel?.invokeMethod("remoteAction", arguments: payload)
+             }
+           }
+           
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,247 @@
+          @@ -0,0 +1,275 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -332,6 +537,9 @@ jobs:
           +///
           +/// `create` 回传的 playerId 同时充当「纹理 id」：`Texture` 在 iOS 上不可用，
           +/// 页面通过 [IosPlatform.videoSurface] 用这个 id 反查 [VideoController]。
+          +/// 原生桥：音频会话 + 锁屏/控制中心的「正在播放」（见 ios/Runner/AppDelegate.swift）。
+          +const _nativePlayback = MethodChannel('fqapp/ios_playback');
+          +
           +class IosPlatform {
           +  static final _events = StreamController<Map<String, dynamic>>.broadcast();
           +  static final _players = <int, _IosPlayer>{};
@@ -347,6 +555,21 @@ jobs:
           +      return const Stream<dynamic>.empty();
           +    };
           +    PlatformChannels.invoke = _invoke;
+          +
+          +    // 锁屏、控制中心、耳机线控的按钮：原生桥转成播放器已有的指令格式，
+          +    // 复用 Android 前台服务那一套处理逻辑（NativePlayer._handleMethodCall）。
+          +    _nativePlayback.setMethodCallHandler((call) async {
+          +      if (call.method == 'remoteAction') {
+          +        await PlatformChannels.notify(
+          +          'fqapp/native_player',
+          +          'onNotificationAction',
+          +          call.arguments,
+          +        );
+          +      }
+          +      return null;
+          +    });
+          +    // 启动时就激活音频会话，别等第一次锁屏才配置。
+          +    unawaited(_nativePlayback.invokeMethod<void>('configure'));
           +  }
           +
           +  /// 渲染视频画面。与 `DesktopPlatform.videoSurface` 同签名，页面按平台二选一。
@@ -396,10 +619,20 @@ jobs:
           +        }
           +        return null;
           +
-          +      // 系统媒体卡片 / 前台服务 / 悬浮窗都是 Android 专有概念，iOS 直接吞掉。
-          +      case 'setKeepScreenOn':
+          +      // 锁屏 / 控制中心的「正在播放」交给原生桥。
           +      case 'startListenForeground':
+          +        await _nativePlayback.invokeMethod<void>(
+          +          'startListenForeground',
+          +          Map<String, dynamic>.from(args),
+          +        );
+          +        return null;
+          +
           +      case 'stopListenForeground':
+          +        await _nativePlayback.invokeMethod<void>('stopListenForeground');
+          +        return null;
+          +
+          +      // 前台服务保活、悬浮窗、亮屏都是 Android 专有概念，iOS 没有对应实现。
+          +      case 'setKeepScreenOn':
           +      case 'allocateFloatingOwner':
           +      case 'startFloating':
           +      case 'showFloating':
@@ -559,6 +792,8 @@ jobs:
           grep -q "isIOSPlatform" lib/pages/player_page.dart && echo "player_page OK"
           grep -q 'target_os = "ios"' rust/Cargo.toml && echo "cargo cfg OK"
           grep -q 'target_os = "ios"' rust/src/network.rs && echo "network cfg OK"
+          grep -q "PlaybackBridge" ios/Runner/AppDelegate.swift && echo "playback bridge OK"
+          grep -q "fqapp/ios_playback" lib/services/ios_platform.dart && echo "channel OK"
           test -f lib/services/ios_platform.dart && echo "ios_platform.dart OK"
 
       - name: Select newest installed Xcode
