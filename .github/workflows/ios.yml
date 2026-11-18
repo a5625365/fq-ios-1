@@ -518,7 +518,7 @@ jobs:
            
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,378 @@
+          @@ -0,0 +1,405 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -609,10 +609,11 @@ jobs:
           +  /// 渲染视频画面。与 `DesktopPlatform.videoSurface` 同签名，页面按平台二选一。
           +  static Widget videoSurface(int id, {Key? key}) {
           +    final host = _players[id];
-          +    if (host == null) return const SizedBox.expand();
+          +    final controller = host?.video;
+          +    if (controller == null) return const SizedBox.expand();
           +    return Video(
           +      key: key,
-          +      controller: host.video,
+          +      controller: controller,
           +      controls: NoVideoControls,
           +      fit: BoxFit.fill,
           +      pauseUponEnteringBackgroundMode: false,
@@ -635,7 +636,13 @@ jobs:
           +    switch (method) {
           +      case 'create':
           +        final id = _nextId++;
-          +        final host = _IosPlayer(id, _events.add);
+          +        // 听书是纯音频：绝不能建 VideoController —— 锁屏/切后台时 iOS 会拆掉
+          +        // 纹理，libmpv 的视频输出失效后会把整个播放器带崩，表现为「播放错误」。
+          +        final host = _IosPlayer(
+          +          id,
+          +          _events.add,
+          +          audioOnly: args['audioOnly'] == true,
+          +        );
           +        _players[id] = host;
           +        unawaited(
           +          host.open(
@@ -698,11 +705,16 @@ jobs:
           +}
           +
           +class _IosPlayer {
-          +  _IosPlayer(this.id, this.emit) {
-          +    video = VideoController(player);
-          +    unawaited(
-          +      video.waitUntilFirstFrameRendered.then((_) => _event('firstFrame', true)),
-          +    );
+          +  _IosPlayer(this.id, this.emit, {this.audioOnly = false}) {
+          +    if (!audioOnly) {
+          +      final controller = VideoController(player);
+          +      video = controller;
+          +      unawaited(
+          +        controller.waitUntilFirstFrameRendered.then(
+          +          (_) => _event('firstFrame', true),
+          +        ),
+          +      );
+          +    }
           +    _subscriptions.addAll([
           +      player.stream.position.listen((v) {
           +        _lastPosition = v;
@@ -724,7 +736,10 @@ jobs:
           +  final int id;
           +  final void Function(Map<String, dynamic>) emit;
           +  final player = Player();
-          +  late final VideoController video;
+          +  final bool audioOnly;
+          +
+          +  /// 纯音频不建视频输出；短剧/漫剧才有。
+          +  VideoController? video;
           +  final _subscriptions = <StreamSubscription<dynamic>>[];
           +  final _ready = Completer<void>();
           +  DesktopMedia? _media;
@@ -752,21 +767,33 @@ jobs:
           +    });
           +  }
           +
-          +  /// 解密会话偶发卡在探测阶段（上游 CDN 抖动、被限速），单次失败就报
-          +  /// 「加载超时」太脆。这里给一次重试，失败才真的往上报。
+          +  /// 解密会话要先向上游 CDN 探测一次（`fq_desktop_media_open` 内部做的），
+          +  /// 锁屏时电台进入省电模式，这一次探测最容易超时，进而表现为「没有网络、
+          +  /// 不会自动下一集」。这里改成三次尝试 + 递增退避，总耗时压在播放器
+          +  /// 25 秒的创建超时之内；重试期间上报 buffering，界面显示加载而不是报错。
           +  Future<DesktopMedia> _openSessionWithRetry() async {
+          +    const attempts = 3;
+          +    const perAttempt = Duration(seconds: 6);
+          +    const backoff = [Duration(milliseconds: 600), Duration(seconds: 2)];
           +    Object? last;
-          +    for (var attempt = 0; attempt < 2; attempt++) {
+          +    for (var attempt = 0; attempt < attempts; attempt++) {
+          +      final pending = DesktopMedia.open(_sourceUrl, _keyHex);
           +      try {
-          +        return await DesktopMedia.open(
-          +          _sourceUrl,
-          +          _keyHex,
-          +        ).timeout(const Duration(seconds: 15));
+          +        final session = await pending.timeout(perAttempt);
+          +        _event('buffering', false);
+          +        return session;
           +      } catch (error) {
           +        last = error;
-          +        AppLog.w('ios-player', 'id=$id media session attempt ${attempt + 1} failed: $error');
-          +        if (attempt == 0) {
-          +          await Future<void>.delayed(const Duration(milliseconds: 400));
+          +        // 超时的那一次如果稍后才成功，会留下一个没人关闭的本机会话
+          +        // （端口 + 线程），这里补一刀回收。
+          +        unawaited(pending.then<void>((s) => s.close()).catchError((Object _) {}));
+          +        AppLog.w(
+          +          'ios-player',
+          +          'id=$id session attempt ${attempt + 1}/$attempts failed: $error',
+          +        );
+          +        if (attempt < backoff.length) {
+          +          _event('buffering', true);
+          +          await Future<void>.delayed(backoff[attempt]);
           +        }
           +      }
           +    }
