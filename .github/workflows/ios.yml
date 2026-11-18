@@ -18,7 +18,7 @@ on:
       source_ref:
         description: 分支或 tag
         type: string
-        default: 'master'
+        default: 'c0a23ca71a9330e23c832dd08991fef2c652e026'
       flutter_version:
         description: Flutter 版本（pubspec.lock 要求 >=3.47.0）
         type: string
