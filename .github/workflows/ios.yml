@@ -535,26 +535,32 @@ jobs:
              int? get playerId => _playerId;
           --- a/lib/services/audio_playback_controller.dart
           +++ b/lib/services/audio_playback_controller.dart
-          @@ -142,9 +142,16 @@
+          @@ -141,11 +141,20 @@
+               final nextId = _chapters[_index + 1].itemId;
                final cacheKey = '$nextId|$_toneId';
                if (_audioSourceCache.containsKey(cacheKey)) return;
-               unawaited(
+          -    unawaited(
           -      _loadSourceWithRetry(
           -        nextId,
           -      ).catchError((Object _) => AudioSource(itemId: nextId, url: '')),
-          +      _loadSourceWithRetry(nextId)
-          +          .then((source) {
-          +            // 平台层（iOS）用它在当前集还在播时先把下一集的解密会话建好，
-          +            // 避免换章那一刻没有网络可用。
-          +            final warm = NativePlayer.warmMediaSession;
-          +            if (warm != null && source.url.isNotEmpty) {
-          +              unawaited(warm(source.url, source.keyHex));
-          +            }
-          +          })
-          +          .catchError((Object _) => AudioSource(itemId: nextId, url: '')),
-               );
+          -    );
+          +    // 预取失败不影响当前播放：换章时 _loadSourceWithRetry 会再试一次。
+          +    unawaited(() async {
+          +      try {
+          +        final source = await _loadSourceWithRetry(nextId);
+          +        // 平台层（iOS）用它在当前集还在播时先把下一集的解密会话建好，
+          +        // 避免换章那一刻没有网络可用。
+          +        final warm = NativePlayer.warmMediaSession;
+          +        if (warm != null && source.url.isNotEmpty) {
+          +          await warm(source.url, source.keyHex);
+          +        }
+          +      } catch (_) {
+          +        // 忽略：预取是尽力而为。
+          +      }
+          +    }());
              }
            
+             /// Resolves the listening-page decorations. See [AudioExtras].
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
           @@ -0,0 +1,452 @@
