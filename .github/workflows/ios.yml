@@ -563,7 +563,7 @@ jobs:
              /// Resolves the listening-page decorations. See [AudioExtras].
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,452 @@
+          @@ -0,0 +1,455 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -701,10 +701,13 @@ jobs:
           +    dynamic arguments,
           +  ) async {
           +    if (channel != 'fqapp/native_player') {
-          +      // 其余 fqapp/* 通道（system_tts、reader 亮度、分享等）在 iOS 上确实
-          +      // 没有原生实现。保持与「没有适配层」时一致的 MissingPluginException，
-          +      // 调用方已有的降级分支照常生效。
-          +      throw MissingPluginException('$channel.$method');
+          +      // 其余 fqapp/* 通道必须交回**真实**的 MethodChannel，不能一律抛异常：
+          +      // iOS 侧确实实现了其中一部分（AppDelegate 里的 fqapp/secure_keys 走 Keychain），
+          +      // 而我们一旦拦下就统一 MissingPluginException，密钥读不出来 →
+          +      // Hive 加密缓存打不开 → 整本下载点了没反应。
+          +      // 没有原生实现的通道（system_tts、reader 亮度、分享等）由真实通道照常抛
+          +      // MissingPluginException，调用方已有的降级分支不受影响。
+          +      return MethodChannel(channel).invokeMethod<dynamic>(method, arguments);
           +    }
           +    final args = arguments is Map ? arguments : const <dynamic, dynamic>{};
           +    switch (method) {
