@@ -557,7 +557,7 @@ jobs:
            
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,451 @@
+          @@ -0,0 +1,452 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -568,7 +568,8 @@ jobs:
           +
           +import 'app_log.dart';
           +import 'desktop_media.dart';
-          +import 'native_player.dart';
+          +// media_kit 内部也导出名为 NativePlayer 的类，这里必须加前缀区分。
+          +import 'native_player.dart' as fq;
           +import 'platform_channel.dart';
           +
           +bool get isIOSPlatform => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
@@ -583,7 +584,7 @@ jobs:
           +///   * 画面走 media_kit_video 的 [VideoController]，和 Windows 端同一实现；
           +///   * 解密复用 Rust 核心的 `fq_desktop_media_open`，它把「CDN 地址 + key」
           +///     换成本机 127.0.0.1 上的明文流，和 Windows/Linux 完全同一条路径；
-          +///   * 事件格式与 [NativePlayer] 读取的字段一一对应（type/value/playerId）。
+          +///   * 事件格式与 fq.NativePlayer 读取的字段一一对应（type/value/playerId）。
           +///
           +/// `create` 回传的 playerId 同时充当「纹理 id」：`Texture` 在 iOS 上不可用，
           +/// 页面通过 [IosPlatform.videoSurface] 用这个 id 反查 [VideoController]。
@@ -612,7 +613,7 @@ jobs:
           +      return const Stream<dynamic>.empty();
           +    };
           +    PlatformChannels.invoke = _invoke;
-          +    NativePlayer.warmMediaSession = _warm;
+          +    fq.NativePlayer.warmMediaSession = _warm;
           +
           +    // 锁屏、控制中心、耳机线控的按钮：原生桥转成播放器已有的指令格式，
           +    // 复用 Android 前台服务那一套处理逻辑（NativePlayer._handleMethodCall）。
@@ -1076,6 +1077,8 @@ jobs:
           flutter analyze --no-pub \
             lib/services/ios_platform.dart \
             lib/services/desktop_media.dart \
+            lib/services/native_player.dart \
+            lib/services/audio_playback_controller.dart \
             lib/main.dart
 
       # Rust 核心编成 staticlib → ios/Frameworks/libfqapi_core.a
