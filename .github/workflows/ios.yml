@@ -16,7 +16,9 @@ on:
         type: string
         default: 'ch6vip/fqapp'
       source_ref:
-        description: 分支或 tag
+        # 固定到补丁基线所在的提交：上游 master 会持续更新，一旦动了补丁涉及的文件，
+        # git apply 就会上下文不匹配。要升级上游时，改这里并在本地重生成补丁。
+        description: 分支、tag 或提交 SHA（默认钉在补丁基线）
         type: string
         default: 'c0a23ca71a9330e23c832dd08991fef2c652e026'
       flutter_version:
@@ -310,7 +312,7 @@ jobs:
            import Security
            import UIKit
            
-          @@ -8,12 +10,195 @@
+          @@ -8,12 +10,203 @@
                _ application: UIApplication,
                didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
              ) -> Bool {
@@ -366,17 +368,25 @@ jobs:
           +      else { return }
           +      switch type {
           +      case .began:
-          +        // 来电等打断：交给系统暂停，恢复时重新激活会话。
-          +        break
+          +        // 别的 App 抢占音频（视频、语音、导航、来电）时，系统会直接停掉我们的
+          +        // 会话。此时若不主动暂停，libmpv 会在失效的会话上继续输出，随即报错，
+          +        // 表现就是「一有干扰就断开且不再继续」。
+          +        notifyDartInterruption(began: true)
           +      case .ended:
-          +        let optionsRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-          +        if AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume) {
-          +          try? session.setActive(true)
-          +        }
+          +        // 不论系统是否给出 shouldResume，都先重新激活会话：否则下一次播放
+          +        // 会因为会话仍处于失效状态而立刻再次被打断。
+          +        try? session.setActive(true)
+          +        notifyDartInterruption(began: false)
           +      @unknown default:
           +        break
           +      }
           +    }
+          +  }
+          +
+          +  /// 把音频中断事件转给 Dart：暂停与恢复都由 Dart 侧的播放器执行，
+          +  /// 原生只负责会话本身，避免两边各持一份播放状态。
+          +  private static func notifyDartInterruption(began: Bool) {
+          +    channel?.invokeMethod("audioInterruption", arguments: ["began": began])
           +  }
           +
           +  static func register(messenger: FlutterBinaryMessenger) {
@@ -508,7 +518,7 @@ jobs:
            
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,275 @@
+          @@ -0,0 +1,378 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -545,6 +555,9 @@ jobs:
           +  static final _players = <int, _IosPlayer>{};
           +  static int _nextId = 1;
           +  static bool _installed = false;
+          +  /// 最近一次收到 play 指令的播放器：音频中断只影响它，不影响页面里的其它实例。
+          +  static int? _activePlayerId;
+          +  static bool _resumeAfterInterruption = false;
           +
           +  static Future<void> install() async {
           +    if (_installed) return;
@@ -559,17 +572,38 @@ jobs:
           +    // 锁屏、控制中心、耳机线控的按钮：原生桥转成播放器已有的指令格式，
           +    // 复用 Android 前台服务那一套处理逻辑（NativePlayer._handleMethodCall）。
           +    _nativePlayback.setMethodCallHandler((call) async {
-          +      if (call.method == 'remoteAction') {
-          +        await PlatformChannels.notify(
-          +          'fqapp/native_player',
-          +          'onNotificationAction',
-          +          call.arguments,
-          +        );
+          +      switch (call.method) {
+          +        case 'remoteAction':
+          +          await PlatformChannels.notify(
+          +            'fqapp/native_player',
+          +            'onNotificationAction',
+          +            call.arguments,
+          +          );
+          +        case 'audioInterruption':
+          +          final args = call.arguments;
+          +          _handleAudioInterruption(args is Map && args['began'] == true);
           +      }
           +      return null;
           +    });
           +    // 启动时就激活音频会话，别等第一次锁屏才配置。
           +    unawaited(_nativePlayback.invokeMethod<void>('configure'));
+          +  }
+          +
+          +  /// 别的 App 抢走音频会话时暂停，会话还回来时继续。
+          +  ///
+          +  /// 不暂停的话，libmpv 会在失效的会话上继续喂数据，直接触发 error 事件，
+          +  /// 播放器进入错误态就不会自己恢复了 —— 表现就是「有干扰就断，断了不续」。
+          +  static void _handleAudioInterruption(bool began) {
+          +    final id = _activePlayerId;
+          +    final host = id == null ? null : _players[id];
+          +    if (host == null) return;
+          +    if (began) {
+          +      _resumeAfterInterruption = host.isPlaying;
+          +      if (_resumeAfterInterruption) unawaited(host.suspendForInterruption());
+          +    } else if (_resumeAfterInterruption) {
+          +      _resumeAfterInterruption = false;
+          +      unawaited(host.resumeAfterInterruption());
+          +    }
           +  }
           +
           +  /// 渲染视频画面。与 `DesktopPlatform.videoSurface` 同签名，页面按平台二选一。
@@ -650,6 +684,8 @@ jobs:
           +        final id = args['id'];
           +        final host = id is num ? _players[id.toInt()] : null;
           +        if (host == null) return null;
+          +        // 记住真正在播的那个实例，中断恢复时只动它。
+          +        if (method == 'play' && id is num) _activePlayerId = id.toInt();
           +        await host.command(method, args);
           +        return null;
           +
@@ -668,7 +704,10 @@ jobs:
           +      video.waitUntilFirstFrameRendered.then((_) => _event('firstFrame', true)),
           +    );
           +    _subscriptions.addAll([
-          +      player.stream.position.listen((v) => _event('position', v.inMilliseconds)),
+          +      player.stream.position.listen((v) {
+          +        _lastPosition = v;
+          +        _event('position', v.inMilliseconds);
+          +      }),
           +      player.stream.duration.listen((v) => _event('duration', v.inMilliseconds)),
           +      player.stream.playing.listen((v) => _event('playing', v)),
           +      player.stream.buffering.listen((v) => _event('buffering', v)),
@@ -691,6 +730,12 @@ jobs:
           +  DesktopMedia? _media;
           +  bool disposed = false;
           +
+          +  /// 重建会话所需的原始信息：中断恢复时不能复用旧会话（它可能已被回收），
+          +  /// 必须拿同一组 url + key 重新开一条本地明文流。
+          +  String _sourceUrl = '';
+          +  String _keyHex = '';
+          +  Duration _lastPosition = Duration.zero;
+          +
           +  void _event(String type, dynamic value) {
           +    if (!disposed) emit({'playerId': id, 'type': type, 'value': value});
           +  }
@@ -707,12 +752,35 @@ jobs:
           +    });
           +  }
           +
+          +  /// 解密会话偶发卡在探测阶段（上游 CDN 抖动、被限速），单次失败就报
+          +  /// 「加载超时」太脆。这里给一次重试，失败才真的往上报。
+          +  Future<DesktopMedia> _openSessionWithRetry() async {
+          +    Object? last;
+          +    for (var attempt = 0; attempt < 2; attempt++) {
+          +      try {
+          +        return await DesktopMedia.open(
+          +          _sourceUrl,
+          +          _keyHex,
+          +        ).timeout(const Duration(seconds: 15));
+          +      } catch (error) {
+          +        last = error;
+          +        AppLog.w('ios-player', 'id=$id media session attempt ${attempt + 1} failed: $error');
+          +        if (attempt == 0) {
+          +          await Future<void>.delayed(const Duration(milliseconds: 400));
+          +        }
+          +      }
+          +    }
+          +    throw last ?? StateError('无法创建媒体会话');
+          +  }
+          +
           +  Future<void> open(String url, String key) async {
           +    _ready.future.ignore();
+          +    _sourceUrl = url;
+          +    _keyHex = key;
           +    try {
           +      var playbackUrl = url;
           +      if (key.isNotEmpty) {
-          +        final session = await DesktopMedia.open(url, key);
+          +        final session = await _openSessionWithRetry();
           +        if (disposed) {
           +          session.close();
           +          return;
@@ -766,6 +834,51 @@ jobs:
           +        if (volume is num) {
           +          await player.setVolume(volume.toDouble().clamp(0, 1) * 100);
           +        }
+          +    }
+          +  }
+          +
+          +  bool get isPlaying => !disposed && player.state.playing;
+          +
+          +  /// 音频被别的 App 抢占：只暂停，不把状态打成错误，也不清理解密会话，
+          +  /// 这样会话还回来后可以从原位置继续。
+          +  Future<void> suspendForInterruption() async {
+          +    if (disposed) return;
+          +    try {
+          +      await player.pause();
+          +    } catch (_) {}
+          +    _event('playWhenReady', false);
+          +  }
+          +
+          +  Future<void> resumeAfterInterruption() async {
+          +    if (disposed || _sourceUrl.isEmpty) return;
+          +    final resumeAt = _lastPosition;
+          +    try {
+          +      // 旧会话在中断期间可能已经被 Rust 侧回收，继续 play() 只会等来
+          +      // 25 秒的「加载超时」。这里直接重建：关旧会话 → 开新会话 → 重新载入 → 回到原位。
+          +      _media?.close();
+          +      _media = null;
+          +      var playbackUrl = _sourceUrl;
+          +      if (_keyHex.isNotEmpty) {
+          +        final session = await _openSessionWithRetry();
+          +        if (disposed) {
+          +          session.close();
+          +          return;
+          +        }
+          +        _media = session;
+          +        playbackUrl = session.url;
+          +      }
+          +      await player.open(Media(playbackUrl), play: false);
+          +      if (disposed) return;
+          +      if (resumeAt > Duration.zero) {
+          +        await player.seek(resumeAt);
+          +        _event('position', resumeAt.inMilliseconds);
+          +      }
+          +      await player.play();
+          +      _event('playWhenReady', true);
+          +      AppLog.d('ios-player', 'id=$id resumed at ${resumeAt.inSeconds}s');
+          +    } catch (error) {
+          +      AppLog.w('ios-player', 'id=$id resume failed: $error');
+          +      if (!disposed) emit({'playerId': id, 'type': 'error', 'value': desktopOpenFailure(id, error)});
           +    }
           +  }
           +
