@@ -561,6 +561,32 @@ jobs:
              }
            
              /// Resolves the listening-page decorations. See [AudioExtras].
+          --- a/lib/services/native_secure_key_storage.dart
+          +++ b/lib/services/native_secure_key_storage.dart
+          @@ -3,6 +3,7 @@
+           import 'linux_libsecret_key_store.dart';
+           import 'migrating_secure_key_storage.dart';
+           import 'platform_channel.dart';
+          +import 'resilient_secure_key_storage.dart';
+           import 'secure_key_storage.dart';
+           import 'windows_dpapi_key_store.dart';
+           
+          @@ -82,8 +83,12 @@
+           SecureKeyStorage defaultSecureKeyStorage() {
+             final native = NativeSecureKeyStorage();
+             if (!native.isSupported) return const FlutterSecureKeyStorage();
+          -  return MigratingSecureKeyStorage(
+          -    primary: native,
+          -    legacy: const FlutterSecureKeyStorage(),
+          +  // 自签 iOS 包经常没有 Keychain entitlement，原生写入会失败；套一层兜底，
+          +  // 否则加密缓存和设备池密钥全部拿不到（下载失效、视频接口 500）。
+          +  return ResilientSecureKeyStorage(
+          +    MigratingSecureKeyStorage(
+          +      primary: native,
+          +      legacy: const FlutterSecureKeyStorage(),
+          +    ),
+             );
+           }
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
           @@ -0,0 +1,459 @@
@@ -1023,6 +1049,132 @@ jobs:
           +    }
           +  }
           +}
+          --- /dev/null
+          +++ b/lib/services/resilient_secure_key_storage.dart
+          @@ -0,0 +1,123 @@
+          +import 'dart:convert';
+          +import 'dart:io';
+          +
+          +import 'package:path_provider/path_provider.dart';
+          +
+          +import 'app_log.dart';
+          +import 'secure_key_storage.dart';
+          +
+          +/// 给原生密钥库兜底的一层。
+          +///
+          +/// 自签安装的 iOS 包常常读不到 Keychain：Sideloadly 用免费证书重签后，App 没有
+          +/// `keychain-access-groups` entitlement，写入会直接报 `-34018`（missing entitlement）。
+          +/// 上游 [SecureKeyProvider] 把所有异常都吞成 `null`，于是：
+          +///
+          +///   * Hive 加密缓存拿不到密钥 → 章节缓存/整本下载点了没反应；
+          +///   * 设备池密钥下发不了 → Rust 侧 `fq_desktop_media_open` 与视频地址接口拿不到
+          +///     可用设备 → 短剧/漫剧返回 500，界面提示「播放服务暂时不可用」。
+          +///
+          +/// 这里在原生存储失败时退回应用私有目录里的一个 JSON 文件。安全性弱于 Keychain
+          +/// （没有硬件绑定、不随备份迁移），只在原生确实不可用时才启用，并且不会覆盖
+          +/// 原生里已有的值。
+          +class ResilientSecureKeyStorage implements SecureKeyStorage {
+          +  ResilientSecureKeyStorage(this._primary);
+          +
+          +  final SecureKeyStorage _primary;
+          +  final _fallback = _FileSecureKeyStorage();
+          +  bool _degraded = false;
+          +
+          +  void _degrade(Object error) {
+          +    if (_degraded) return;
+          +    _degraded = true;
+          +    AppLog.w('secure_keys', '原生密钥库不可用，改用本地文件兜底: $error');
+          +  }
+          +
+          +  @override
+          +  Future<String?> read(String key) async {
+          +    try {
+          +      final value = await _primary.read(key);
+          +      if (value != null) return value;
+          +      // 原生里没有：可能是之前写进了兜底文件，也要查一次。
+          +      return await _fallback.read(key);
+          +    } catch (error) {
+          +      _degrade(error);
+          +      return _fallback.read(key);
+          +    }
+          +  }
+          +
+          +  @override
+          +  Future<void> write(String key, String value) async {
+          +    try {
+          +      await _primary.write(key, value);
+          +      return;
+          +    } catch (error) {
+          +      _degrade(error);
+          +    }
+          +    await _fallback.write(key, value);
+          +  }
+          +
+          +  @override
+          +  Future<void> delete(String key) async {
+          +    try {
+          +      await _primary.delete(key);
+          +    } catch (error) {
+          +      _degrade(error);
+          +    }
+          +    await _fallback.delete(key);
+          +  }
+          +}
+          +
+          +/// 兜底实现：应用私有目录下的 JSON 映射。文件权限随沙箱，其他 App 读不到。
+          +class _FileSecureKeyStorage implements SecureKeyStorage {
+          +  static const _fileName = 'secure_keys_fallback.json';
+          +  Map<String, String>? _cache;
+          +
+          +  Future<File> _file() async {
+          +    final dir = await getApplicationSupportDirectory();
+          +    return File('${dir.path}/$_fileName');
+          +  }
+          +
+          +  Future<Map<String, String>> _load() async {
+          +    final cache = _cache;
+          +    if (cache != null) return cache;
+          +    try {
+          +      final file = await _file();
+          +      if (!await file.exists()) return _cache = <String, String>{};
+          +      final decoded = jsonDecode(await file.readAsString());
+          +      final map = <String, String>{};
+          +      if (decoded is Map) {
+          +        for (final entry in decoded.entries) {
+          +          final value = entry.value;
+          +          if (value is String) map['${entry.key}'] = value;
+          +        }
+          +      }
+          +      return _cache = map;
+          +    } catch (_) {
+          +      return _cache = <String, String>{};
+          +    }
+          +  }
+          +
+          +  Future<void> _save(Map<String, String> values) async {
+          +    _cache = values;
+          +    final file = await _file();
+          +    await file.parent.create(recursive: true);
+          +    await file.writeAsString(jsonEncode(values), flush: true);
+          +  }
+          +
+          +  @override
+          +  Future<String?> read(String key) async => (await _load())[key];
+          +
+          +  @override
+          +  Future<void> write(String key, String value) async {
+          +    final values = Map<String, String>.from(await _load());
+          +    values[key] = value;
+          +    await _save(values);
+          +  }
+          +
+          +  @override
+          +  Future<void> delete(String key) async {
+          +    final values = Map<String, String>.from(await _load());
+          +    values.remove(key);
+          +    await _save(values);
+          +  }
+          +}
           PATCH_EOF
           echo "补丁行数: $(wc -l < "$PATCH")"
           git -c core.autocrlf=false apply --verbose "$PATCH"
@@ -1091,6 +1243,8 @@ jobs:
             lib/services/ios_platform.dart \
             lib/services/desktop_media.dart \
             lib/services/native_player.dart \
+            lib/services/resilient_secure_key_storage.dart \
+            lib/services/native_secure_key_storage.dart \
             lib/services/audio_playback_controller.dart \
             lib/main.dart
 
