@@ -587,6 +587,37 @@ jobs:
           +    ),
              );
            }
+          --- a/lib/services/playback_issue.dart
+          +++ b/lib/services/playback_issue.dart
+          @@ -4,6 +4,8 @@
+           import 'package:http/http.dart' as http;
+           
+           import 'api_client.dart';
+          +import 'app_log.dart';
+          +
+           import 'native_player.dart';
+           
+           /// User-facing explanations only. Raw exceptions can contain signed video URLs
+          @@ -23,6 +25,19 @@
+             const PlaybackIssue(this.title, this.message);
+           
+             static PlaybackIssue fromError(Object error) {
+          +    final issue = _resolve(error);
+          +    // 界面只给一句笼统提示，但排查时需要知道后端到底说了什么：
+          +    // 例如「设备池为空」和「上游 403」在界面上都长得一样，日志里必须分开。
+          +    if (issue == service || issue == unavailable || issue == unknown) {
+          +      final detail = error is ApiException
+          +          ? 'status=${error.statusCode} message=${error.message}'
+          +          : error.runtimeType.toString();
+          +      AppLog.w('playback', '${issue.name}: $detail');
+          +    }
+          +    return issue;
+          +  }
+          +
+          +  static PlaybackIssue _resolve(Object error) {
+               if (error is TimeoutException) return timeout;
+               if (error is NativePlaybackException) {
+                 final status = error.httpStatusCode;
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
           @@ -0,0 +1,459 @@
@@ -1245,6 +1276,7 @@ jobs:
             lib/services/native_player.dart \
             lib/services/resilient_secure_key_storage.dart \
             lib/services/native_secure_key_storage.dart \
+            lib/services/playback_issue.dart \
             lib/services/audio_playback_controller.dart \
             lib/main.dart
 
