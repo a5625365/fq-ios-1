@@ -563,7 +563,7 @@ jobs:
              /// Resolves the listening-page decorations. See [AudioExtras].
           --- /dev/null
           +++ b/lib/services/ios_platform.dart
-          @@ -0,0 +1,455 @@
+          @@ -0,0 +1,459 @@
           +import 'dart:async';
           +
           +import 'package:flutter/foundation.dart';
@@ -911,11 +911,15 @@ jobs:
           +        playbackUrl = session.url;
           +      }
           +      if (disposed) return;
+          +      // 必须先发「创建完成」再 open：页面收到它才会挂载 Video 组件，
+          +      // 而 libmpv 要等渲染面挂上才会解出首帧、open() 才会返回。
+          +      // 顺序颠倒就是死锁 —— 短剧/漫剧一直转圈、永远不出画面。
+          +      _event('created', id);
           +      await player.open(Media(playbackUrl), play: false);
           +      if (disposed) return;
+          +      // open 返回后才放行 play/pause 等指令：太早调 play，mpv 还没建好管线，
+          +      // 指令会被丢弃，画面依旧不出来。
           +      if (!_ready.isCompleted) _ready.complete();
-          +      // 纯音频同样回一个占位 id 当作「创建完成」，页面不会去取画面。
-          +      _event('created', id);
           +      _size();
           +      AppLog.d('ios-player', 'id=$id opened');
           +    } catch (error) {
